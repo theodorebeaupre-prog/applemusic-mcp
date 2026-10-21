@@ -117,3 +117,7 @@ Les tests du scoring sont hors-ligne : la recherche iTunes est simulée.
 Ce projet a été conçu et testé avec Théodore Beaupré. Le code d'implémentation a été majoritairement généré par un agent IA (Claude Code).
 
 Projet non affilié à Apple. Apple Music est une marque d'Apple Inc.
+
+## Licence
+
+[MIT](LICENSE)
