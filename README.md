@@ -1,56 +1,56 @@
 # applemusic-mcp
 
-**Contrôler Apple Music depuis Claude (ou ton terminal) sur Linux.** Sans clé API ni compte développeur, et sans aucune dépendance Python.
+**Control Apple Music from Claude (or your terminal) on Linux.** No API key, no developer account, and zero Python dependencies.
 
 ```
-toi    › mets-moi du Kavinsky
+you    › put on some Kavinsky
 claude › play_song("Kavinsky Nightcall")
        ▶ Kavinsky – Nightcall  (Nightcall)
 ```
 
-Il n'existe pas de connecteur Apple Music officiel pour les assistants IA. Ce projet en fabrique un avec deux choses qui existent déjà :
+There is no official Apple Music connector for AI assistants. This project builds one out of two things that already exist:
 
-1. **[Sidra](https://github.com/wimpysworld/sidra)**, un client Apple Music pour Linux, qui s'expose sur D-Bus via **MPRIS** et accepte `OpenUri` en `https`.
-2. **L'API iTunes Search (`itunes.apple.com/search`)**, publique et sans authentification. Son `trackId` est le même que l'ID du catalogue Apple Music.
+1. **[Sidra](https://github.com/wimpysworld/sidra)**, an Apple Music client for Linux. It exposes itself on D-Bus through **MPRIS** and accepts `OpenUri` with `https` URLs.
+2. **The iTunes Search API (`itunes.apple.com/search`)**, which is public and needs no authentication. Its `trackId` is the same as the Apple Music catalog ID.
 
 ```
-« Kavinsky Nightcall »
+"Kavinsky Nightcall"
         │  itunes.apple.com/search  (country=ca)
         ▼
-   25 candidats ──► score « meilleure version » ──► trackId 1442447970
+   25 candidates ──► "best version" score ──► trackId 1442447970
         │
-        │  D-Bus : org.mpris.MediaPlayer2.Player.OpenUri
+        │  D-Bus: org.mpris.MediaPlayer2.Player.OpenUri
         ▼
-   https://music.apple.com/song/1442447970  ──►  Sidra joue la chanson
+   https://music.apple.com/song/1442447970  ──►  Sidra plays the song
 ```
 
-## Ce que ça fait
+## What it does
 
-| | CLI `applemusic` | Outil MCP |
+| | `applemusic` CLI | MCP tool |
 |---|---|---|
-| Chercher + jouer la meilleure version | `play "artiste titre"` | `play_song` |
-| Voir les candidats et leur score | `search "..."` | `search_songs` |
-| Jouer une liste dans l'ordre | `queue liste.txt` | `play_queue` |
-| État / arrêt de la file | — | `queue_status`, `stop_queue` |
-| Ce qui joue | `now` | `now_playing` |
-| Pause, reprise, suivant, précédent | `pause` `resume` `toggle` `next` `prev` | `control` |
+| Search + play the best version | `play "artist title"` | `play_song` |
+| Show candidates and their scores | `search "..."` | `search_songs` |
+| Play a list in order | `queue list.txt` | `play_queue` |
+| Queue status / stop | — | `queue_status`, `stop_queue` |
+| Now playing | `now` | `now_playing` |
+| Pause, resume, next, previous | `pause` `resume` `toggle` `next` `prev` | `control` |
 | Volume, shuffle | `vol 0.7`, `shuffle on` | `set_volume`, `set_shuffle` |
 
-### « La meilleure version »
+### "Best version"
 
-Une recherche comme « Help I'm Alive » retourne l'original, des sessions live, des covers en quatuor à cordes, des remixes… Le score :
+A search like "Help I'm Alive" returns the original, live sessions, string quartet covers, remixes… The score:
 
-- **pénalise les variantes non demandées** : slowed, sped up, remix, live, acoustic, instrumental, karaoke, iTunes Session…
-- **pénalise toute parenthèse non demandée** (`(Pete Heller's Stylus)`), mais pas les `(feat. …)` ;
-- **favorise la variante quand tu la demandes** : `pursuit super slowed` donne la version super slowed ;
-- **pénalise les covers** : si l'artiste demandé existe dans les résultats, un autre artiste est rejeté ;
-- **refuse de deviner** : si le titre et l'artiste ne concordent pas, rien ne joue. Par exemple, une toune retirée du catalogue canadien ne sera pas remplacée par une homonyme.
+- **penalizes variants you didn't ask for**: slowed, sped up, remix, live, acoustic, instrumental, karaoke, iTunes Session…
+- **penalizes any parenthesis you didn't ask for** (`(Pete Heller's Stylus)`), except `(feat. …)`;
+- **prefers the variant when you ask for it**: `pursuit super slowed` gets you the super slowed version;
+- **penalizes covers**: if the requested artist shows up in the results, other artists are rejected;
+- **refuses to guess**: if the title and artist don't match, nothing plays. A song missing from the catalog won't be swapped for a different song with the same name.
 
-`applemusic search "..."` montre le score de chaque candidat pour comprendre un choix.
+Run `applemusic search "..."` to see every candidate's score and understand a pick.
 
-## Installation
+## Install
 
-Prérequis : Linux avec D-Bus (`busctl`, fourni par systemd), Python ≥ 3.9, et Sidra ouvert et connecté à ton compte Apple Music.
+Requirements: Linux with D-Bus (`busctl`, shipped with systemd), Python ≥ 3.9, and Sidra open and signed in to your Apple Music account.
 
 ```bash
 git clone https://github.com/theodorebeaupre-prog/applemusic-mcp.git ~/Developer/applemusic-mcp
@@ -58,29 +58,29 @@ ln -s ~/Developer/applemusic-mcp/applemusic     ~/.local/bin/applemusic
 ln -s ~/Developer/applemusic-mcp/applemusic-mcp ~/.local/bin/applemusic-mcp
 ```
 
-### Avec Claude Code
+### With Claude Code
 
 ```bash
 claude mcp add --scope user applemusic -- ~/.local/bin/applemusic-mcp
 ```
 
-Les outils apparaissent dans la prochaine session.
+The tools show up in your next session.
 
-### Avec un autre client MCP (Claude Desktop, etc.)
+### With another MCP client (Claude Desktop, etc.)
 
 ```json
 {
   "mcpServers": {
-    "applemusic": { "command": "/home/<toi>/.local/bin/applemusic-mcp" }
+    "applemusic": { "command": "/home/<you>/.local/bin/applemusic-mcp" }
   }
 }
 ```
 
-## Files d'attente
+## Queues
 
-Sidra n'offre pas l'interface MPRIS `TrackList`, donc on ne peut pas lui envoyer une file. `queue` ouvre chaque chanson une par une : il surveille la position et passe à la suivante à la fin de la toune, ou dès que tu changes de chanson dans Sidra (le skip est respecté).
+Sidra doesn't implement the MPRIS `TrackList` interface, so you can't hand it a queue. `queue` opens each song one at a time: it watches the playback position and moves on when the song ends, or as soon as you change songs in Sidra (skips are respected).
 
-Format de liste : une chanson par ligne. Les numéros et les tirets sont tolérés, et les lignes `#` sont des commentaires.
+List format: one song per line. Leading numbers and dashes are fine, and `#` lines are comments.
 
 ```
 # SHIP MODE
@@ -89,20 +89,20 @@ Kavinsky - Nightcall
 isq pursuit super slowed
 ```
 
-Exemple complet : [`examples/shipmode.txt`](examples/shipmode.txt).
+Full example: [`examples/shipmode.txt`](examples/shipmode.txt).
 
-Avec le MCP, la file tourne dans un **process détaché** et continue même si le chat se ferme. Son état vit dans `~/.cache/applemusic/` (`queue.pid`, `queue.log`, `queue.txt`). `play_song` arrête la file d'abord, sinon elle prendrait ta chanson pour un skip.
+Through MCP, the queue runs in a **detached process** and keeps going even if the chat closes. Its state lives in `~/.cache/applemusic/` (`queue.pid`, `queue.log`, `queue.txt`). `play_song` stops the queue first, otherwise the queue would treat your song as a skip.
 
-## Limites connues
+## Known limitations
 
-- **Sidra seulement** pour jouer une chanson précise : Firefox, Chromium et Zen exposent MPRIS mais pas `OpenUri`. Les autres commandes (pause, next…) pourraient marcher avec d'autres lecteurs en changeant `BUS`.
-- **Catalogue par pays** : la recherche se fait dans le catalogue `ca`. Change `COUNTRY` dans `applemusic` pour le tien.
-- **Pas d'accès à ta bibliothèque** : pas de lecture de tes playlists, de likes ni de création de playlists. Ça demanderait MusicKit, avec un developer token et un user token.
-- Les messages de l'outil sont en français.
+- **Sidra only** for playing a specific song: Firefox, Chromium and Zen expose MPRIS but not `OpenUri`. The other commands (pause, next…) could work with other players by changing `BUS`.
+- **Per-country catalog**: searches run against the `ca` catalog. Change `COUNTRY` in `applemusic` to yours.
+- **No library access**: it can't read your playlists or likes, or create playlists. That would need MusicKit, with a developer token and a user token.
+- Tool output messages are in French (Québec). PRs for i18n are welcome.
 
-## Comment ça marche (le MCP)
+## How it works (the MCP side)
 
-`applemusic-mcp` est un serveur MCP stdio écrit à la main : du JSON-RPC 2.0, un message par ligne, sans SDK. Il importe `applemusic` comme module et redirige son `stdout` pendant chaque appel, parce qu'en stdio, stdout est réservé au protocole et un seul `print()` corromprait la session.
+`applemusic-mcp` is a hand-written stdio MCP server: JSON-RPC 2.0, one message per line, no SDK. It imports `applemusic` as a module and redirects its `stdout` during each call. Over stdio, stdout belongs to the protocol, and a single stray `print()` would corrupt the session.
 
 ## Tests
 
@@ -110,14 +110,14 @@ Avec le MCP, la file tourne dans un **process détaché** et continue même si l
 python3 -m unittest discover -s tests -v
 ```
 
-Les tests du scoring sont hors-ligne : la recherche iTunes est simulée.
+The scoring tests run offline, with the iTunes search mocked.
 
-## Transparence
+## Transparency
 
-Ce projet a été conçu et testé avec Théodore Beaupré. Le code d'implémentation a été majoritairement généré par un agent IA (Claude Code).
+Designed and tested with Theodore Beaupré. Most of the implementation code was generated by an AI agent (Claude Code).
 
-Projet non affilié à Apple. Apple Music est une marque d'Apple Inc.
+Not affiliated with Apple. Apple Music is a trademark of Apple Inc.
 
-## Licence
+## License
 
 [MIT](LICENSE)
