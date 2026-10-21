@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""applemusic — contrôle Apple Music (Sidra) via MPRIS + recherche iTunes publique.
+
+  applemusic play "Kavinsky Nightcall"   cherche la meilleure version et la joue
+  applemusic search "Nightcall"          montre les candidats et leur score
+  applemusic queue liste.txt             joue une liste (une chanson par ligne)
+  applemusic now | pause | toggle | resume | next | prev
+  applemusic vol [0.0-1.0]               lit ou règle le volume
+  applemusic shuffle on|off
+"""
+import json
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+BUS = "org.mpris.MediaPlayer2.sidra"
+PATH = "/org/mpris/MediaPlayer2"
+IFACE = "org.mpris.MediaPlayer2.Player"
+COUNTRY = "ca"
+
+# Mots qui marquent une variante. Pénalisés sauf si la requête les contient.
+VARIANTS = ["slowed", "sped up", "speed up", "nightcore", "reverb", "remix", "mix)",
+            "live", "acoustic", "instrumental", "karaoke", "cover", "tribute",
+            "8d", "edit", "version", "rework", "flip", "bootleg", "lofi", "lo-fi",
+            "session", "demo", "orchestral", "string quartet"]
+
+
+# ---------- MPRIS (busctl) ----------
+
+def busctl(*args, check=True):
+    r = subprocess.run(["busctl", "--user", "--json=short", *args],
+                       capture_output=True, text=True)
+    if check and r.returncode != 0:
+        msg = r.stderr.strip()
+        if "was not provided" in msg or "not found" in msg.lower():
+            sys.exit("Sidra n'est pas ouvert (rien sur D-Bus). Lance Sidra d'abord.")
+        sys.exit(f"busctl: {msg}")
+    return r.stdout
+
+
+def prop(name):
+    out = busctl("get-property", BUS, PATH, IFACE, name)
+    return json.loads(out)["data"]
+
+
+def set_prop(name, sig, value):
+    busctl("set-property", BUS, PATH, IFACE, name, sig, str(value))
+
+
+def call(method, *sig_and_args):
+    busctl("call", BUS, PATH, IFACE, method, *sig_and_args)
+
+
+def now():
+    md = prop("Metadata")
+    get = lambda k: md.get(k, {}).get("data")
+    return {
+        "id": (get("mpris:trackid") or "").rsplit("/", 1)[-1],
+        "title": get("xesam:title") or "",
+        "artist": ", ".join(get("xesam:artist") or []),
+        "album": get("xesam:album") or "",
+        "length": (get("mpris:length") or 0) / 1e6,
+        "status": prop("PlaybackStatus"),
+        "position": prop("Position") / 1e6,
+    }
+
+
+def fmt_time(s):
+    return f"{int(s // 60)}:{int(s % 60):02d}"
+
+
+# ---------- Recherche iTunes ----------
+
+def search(term, limit=25):
+    q = urllib.parse.urlencode({"term": term, "entity": "song",
+                                "country": COUNTRY, "limit": limit})
+    with urllib.request.urlopen(f"https://itunes.apple.com/search?{q}", timeout=10) as r:
+        return json.load(r)["results"]
+
+
+def words(s):
+    return set(re.findall(r"\w+", s.lower()))
+
+
+def score(result, query, rank, artist_known=False):
+    """Plus haut = meilleur. Original > variantes, sauf si on demande la variante."""
+    q = query.lower()
+    title = result.get("trackName", "").lower()
+    album = result.get("collectionName", "").lower()
+    artist = result.get("artistName", "").lower()
+    s = 0.0
+
+    for v in VARIANTS:
+        in_result = v in title or v in album
+        if in_result and v not in q:
+            s -= 30
+        elif in_result and v in q:
+            s += 15  # demandé explicitement : on le veut
+
+    qw = words(query)
+    # Une parenthèse non demandée (« Pete Heller's Stylus », « Remastered »…) = variante.
+    for extra in re.findall(r"[(\[](.*?)[)\]]", title):
+        if not words(extra) <= qw and not extra.strip().startswith(("feat", "with")):
+            s -= 12
+    hits = len(qw & words(artist))
+    s += 8 * hits                           # l'artiste demandé
+    if artist_known and hits == 0:
+        s -= 25                             # un autre artiste = une cover
+    s += 6 * len(qw & words(title))         # le titre demandé
+    if "karaoke" in artist or "tribute" in artist or "cover" in artist:
+        s -= 50
+    if result.get("trackExplicitness") == "explicit":
+        s += 1                              # l'explicit est la version d'origine
+    s -= rank * 0.5                         # l'ordre d'Apple sert de départage
+    return s
+
+
+def best(query):
+    results = search(query)
+    if not results:
+        return None, []
+    qw = words(query)
+    artist_known = any(qw & words(r.get("artistName", "")) for r in results)
+    ranked = sorted(((score(r, query, i, artist_known), r) for i, r in enumerate(results)),
+                    key=lambda x: x[0], reverse=True)
+    top = ranked[0][1]
+    return (top if confident(top, qw, artist_known) else None), ranked
+
+
+def confident(r, qw, artist_known):
+    """Refuse de deviner : le titre (sans parenthèses) doit être dans la requête,
+    et si un artiste de la requête existe dans les résultats, ce doit être lui."""
+    core = words(re.sub(r"[(\[].*?[)\]]", "", r.get("trackName", "")))
+    if not core or not core <= qw:
+        return False
+    return not artist_known or bool(qw & words(r.get("artistName", "")))
+
+
+def label(r):
+    return f"{r['artistName']} – {r['trackName']}  ({r['collectionName']})"
+
+
+# ---------- Lecture ----------
+
+def open_track(track_id, timeout=12):
+    call("OpenUri", "s", f"https://music.apple.com/song/{track_id}")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.75)
+        n = now()
+        if n["id"] == str(track_id) and n["status"] == "Playing":
+            return True
+    return False
+
+
+def play(query):
+    r, _ = best(query)
+    if not r:
+        sys.exit(f"Pas trouvé de version sûre pour « {query} ». Essaie: applemusic search \"{query}\"")
+    print(f"▶ {label(r)}")
+    if not open_track(r["trackId"]):
+        print("  (Sidra n'a pas confirmé la lecture.)")
+    return r
+
+
+def parse_line(line):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    line = re.sub(r"^\d+[.)]\s*", "", line)       # « 12. » en début de ligne
+    return re.sub(r"\s+[–—-]\s+", " ", line)       # « Artiste – Titre » → requête
+
+
+def queue(path):
+    with open(path, encoding="utf-8") as f:
+        queries = [q for q in map(parse_line, f) if q]
+    print(f"{len(queries)} chansons. Ctrl+C pour arrêter.\n")
+    for i, q in enumerate(queries, 1):
+        r, _ = best(q)
+        if not r:
+            print(f"[{i}/{len(queries)}] ✗ introuvable : {q}")
+            continue
+        print(f"[{i}/{len(queries)}] ▶ {label(r)}")
+        tid = str(r["trackId"])
+        if not open_track(tid):
+            print("   (pas confirmé, on passe)")
+            continue
+        # Attendre la fin, ou que l'utilisateur change de chanson dans Sidra.
+        while True:
+            time.sleep(1)
+            n = now()
+            if n["id"] != tid:
+                break                                   # skip manuel ou autoplay
+            if n["status"] == "Paused":
+                continue
+            if n["status"] == "Stopped" or n["position"] >= n["length"] - 1.5:
+                break
+    print("\nFin de la liste.")
+
+
+# ---------- CLI ----------
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd, rest = argv[0], " ".join(argv[1:])
+
+    if cmd == "play" and rest:
+        play(rest)
+    elif cmd in ("play", "resume"):
+        call("Play")
+    elif cmd == "search":
+        _, ranked = best(rest)
+        for s, r in ranked[:8]:
+            print(f"{s:7.1f}  {label(r)}")
+    elif cmd == "queue":
+        try:
+            queue(argv[1])
+        except KeyboardInterrupt:
+            print("\nArrêté.")
+    elif cmd == "now":
+        n = now()
+        print(f"{n['status']}: {n['artist']} – {n['title']}  ({n['album']})  "
+              f"{fmt_time(n['position'])}/{fmt_time(n['length'])}")
+    elif cmd == "pause":
+        call("Pause")
+    elif cmd == "toggle":
+        call("PlayPause")
+    elif cmd == "next":
+        call("Next")
+    elif cmd in ("prev", "previous"):
+        call("Previous")
+    elif cmd == "vol":
+        if rest:
+            set_prop("Volume", "d", max(0.0, min(1.0, float(rest))))
+        print(f"volume {prop('Volume'):.2f}")
+    elif cmd == "shuffle":
+        set_prop("Shuffle", "b", "true" if rest == "on" else "false")
+        print(f"shuffle {'on' if prop('Shuffle') else 'off'}")
+    else:
+        sys.exit(f"Commande inconnue : {cmd}  (applemusic --help)")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

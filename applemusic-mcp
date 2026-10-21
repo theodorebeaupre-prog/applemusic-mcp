@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""applemusic-mcp — serveur MCP (stdio, sans dépendance) autour de `applemusic`.
+
+Protocole : JSON-RPC 2.0, un message par ligne sur stdin/stdout.
+La logique (recherche, score, MPRIS) vit dans ~/.local/bin/applemusic.
+"""
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import signal
+import subprocess
+import sys
+from contextlib import redirect_stdout
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CLI = HERE / "applemusic"
+STATE = Path.home() / ".cache" / "applemusic"
+QUEUE_FILE = STATE / "queue.txt"
+QUEUE_LOG = STATE / "queue.log"
+QUEUE_PID = STATE / "queue.pid"
+
+_loader = importlib.machinery.SourceFileLoader("applemusic", str(CLI))
+_spec = importlib.util.spec_from_loader("applemusic", _loader)
+am = importlib.util.module_from_spec(_spec)
+_loader.exec_module(am)
+
+
+# ---------- File d'attente (process détaché, survit au chat) ----------
+
+def queue_pid():
+    try:
+        pid = int(QUEUE_PID.read_text())
+        os.kill(pid, 0)
+        return pid
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        return None
+
+
+def stop_queue():
+    pid = queue_pid()
+    if pid:
+        os.killpg(pid, signal.SIGTERM)
+    QUEUE_PID.unlink(missing_ok=True)
+    return pid
+
+
+def start_queue(songs):
+    stop_queue()
+    STATE.mkdir(parents=True, exist_ok=True)
+    QUEUE_FILE.write_text("\n".join(songs) + "\n", encoding="utf-8")
+    log = open(QUEUE_LOG, "w", encoding="utf-8")
+    p = subprocess.Popen([sys.executable, "-u", str(CLI), "queue", str(QUEUE_FILE)],
+                         stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+    QUEUE_PID.write_text(str(p.pid))
+    return p.pid
+
+
+def queue_log_tail(n=6):
+    try:
+        lines = QUEUE_LOG.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    return [l for l in lines if l.strip()][-n:]
+
+
+# ---------- Outils ----------
+
+def t_now_playing(_):
+    n = am.now()
+    out = (f"{n['status']}: {n['artist']} – {n['title']} ({n['album']}) "
+           f"{am.fmt_time(n['position'])}/{am.fmt_time(n['length'])}")
+    if queue_pid():
+        out += "\nFile d'attente active :\n" + "\n".join(queue_log_tail(3))
+    return out
+
+
+def t_play_song(a):
+    stop_queue()  # sinon la file verrait le changement et sauterait à la suivante
+    r, ranked = am.best(a["query"])
+    if not r:
+        alts = "\n".join(f"  {am.label(x)}" for _, x in ranked[:5]) or "  (aucun résultat)"
+        return (f"Pas de version sûre pour « {a['query']} » (catalogue {am.COUNTRY}). "
+                f"Candidats :\n{alts}")
+    ok = am.open_track(r["trackId"])
+    return f"{'▶' if ok else '?'} {am.label(r)}" + ("" if ok else " — Sidra n'a pas confirmé.")
+
+
+def t_search_songs(a):
+    r, ranked = am.best(a["query"])
+    lines = [f"{s:6.1f}  {am.label(x)}  [id {x['trackId']}]" for s, x in ranked[:8]]
+    head = f"Choix : {am.label(r)}" if r else "Aucun choix sûr."
+    return head + "\n" + "\n".join(lines)
+
+
+def t_play_queue(a):
+    songs = [s for s in a.get("songs", []) if s.strip()]
+    if a.get("file"):
+        songs += Path(os.path.expanduser(a["file"])).read_text(encoding="utf-8").splitlines()
+    songs = [q for q in map(am.parse_line, songs) if q]
+    if not songs:
+        return "Liste vide."
+    missing = [q for q in songs if not am.best(q)[0]]
+    pid = start_queue(songs)
+    msg = f"File lancée : {len(songs)} chansons (pid {pid})."
+    if missing:
+        msg += "\nIntrouvables (seront sautées) :\n" + "\n".join(f"  ✗ {m}" for m in missing)
+    return msg
+
+
+def t_queue_status(_):
+    pid = queue_pid()
+    tail = "\n".join(queue_log_tail(8)) or "(aucun log)"
+    return f"{'Active (pid %d)' % pid if pid else 'Aucune file active.'}\n{tail}"
+
+
+def t_stop_queue(_):
+    pid = stop_queue()
+    return f"File arrêtée (pid {pid}). La chanson en cours continue." if pid else "Aucune file active."
+
+
+def t_control(a):
+    action = a["action"]
+    method = {"pause": "Pause", "resume": "Play", "toggle": "PlayPause",
+              "next": "Next", "previous": "Previous"}[action]
+    am.call(method)
+    return f"OK : {action}"
+
+
+def t_set_volume(a):
+    am.set_prop("Volume", "d", max(0.0, min(1.0, float(a["level"]))))
+    return f"Volume : {am.prop('Volume'):.2f}"
+
+
+def t_set_shuffle(a):
+    am.set_prop("Shuffle", "b", "true" if a["on"] else "false")
+    return f"Shuffle : {'on' if am.prop('Shuffle') else 'off'}"
+
+
+def schema(props=None, required=None):
+    return {"type": "object", "properties": props or {}, "required": required or []}
+
+
+Q = {"type": "string", "description": "Artiste + titre, ex. « Kavinsky Nightcall ». "
+                                      "Ajoute « slowed », « remix »… pour une variante."}
+
+TOOLS = {
+    "now_playing": (t_now_playing, "Ce qui joue dans Sidra (Apple Music) + état de la file.",
+                    schema()),
+    "play_song": (t_play_song, "Cherche la meilleure version (original par défaut) et la joue "
+                  "tout de suite. Arrête une file en cours.", schema({"query": Q}, ["query"])),
+    "search_songs": (t_search_songs, "Cherche dans le catalogue Apple Music (Canada) sans jouer; "
+                     "montre les candidats et leur score.", schema({"query": Q}, ["query"])),
+    "play_queue": (t_play_queue, "Joue une liste de chansons dans l'ordre, en arrière-plan. "
+                   "Donne `songs` (lignes « Artiste – Titre ») et/ou `file` (chemin d'un .txt).",
+                   schema({"songs": {"type": "array", "items": {"type": "string"}},
+                           "file": {"type": "string"}})),
+    "queue_status": (t_queue_status, "État et dernières lignes de la file d'attente.", schema()),
+    "stop_queue": (t_stop_queue, "Arrête la file d'attente (la toune en cours continue).",
+                   schema()),
+    "control": (t_control, "Contrôle de lecture.",
+                schema({"action": {"type": "string",
+                                   "enum": ["pause", "resume", "toggle", "next", "previous"]}},
+                       ["action"])),
+    "set_volume": (t_set_volume, "Volume de Sidra, 0.0 à 1.0.",
+                   schema({"level": {"type": "number", "minimum": 0, "maximum": 1}}, ["level"])),
+    "set_shuffle": (t_set_shuffle, "Active ou coupe le shuffle.",
+                    schema({"on": {"type": "boolean"}}, ["on"])),
+}
+
+
+# ---------- JSON-RPC ----------
+
+def handle(msg):
+    method, mid = msg.get("method"), msg.get("id")
+    if method == "initialize":
+        return {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2025-06-18"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "applemusic", "version": "0.1.0"}}
+    if method == "ping":
+        return {}
+    if method == "tools/list":
+        return {"tools": [{"name": n, "description": d, "inputSchema": s}
+                          for n, (_, d, s) in TOOLS.items()]}
+    if method == "tools/call":
+        p = msg["params"]
+        fn = TOOLS.get(p["name"], (None,))[0]
+        if not fn:
+            raise KeyError(f"outil inconnu : {p['name']}")
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):       # le CLI imprime; stdout est réservé au protocole
+                text = fn(p.get("arguments") or {})
+            err = False
+        except SystemExit as e:              # le CLI fait sys.exit("message") sur erreur
+            text, err = str(e.code), True
+        except Exception as e:
+            text, err = f"{type(e).__name__}: {e}", True
+        return {"content": [{"type": "text", "text": text}], "isError": err}
+    if mid is None:
+        return None                          # notification (ex. notifications/initialized)
+    raise NotImplementedError(method)
+
+
+def main():
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        msg = json.loads(line)
+        try:
+            result = handle(msg)
+            if msg.get("id") is None:
+                continue
+            reply = {"jsonrpc": "2.0", "id": msg["id"], "result": result}
+        except NotImplementedError as e:
+            reply = {"jsonrpc": "2.0", "id": msg.get("id"),
+                     "error": {"code": -32601, "message": f"méthode inconnue : {e}"}}
+        except Exception as e:
+            reply = {"jsonrpc": "2.0", "id": msg.get("id"),
+                     "error": {"code": -32603, "message": str(e)}}
+        sys.stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
